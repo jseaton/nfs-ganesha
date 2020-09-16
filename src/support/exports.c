@@ -728,6 +728,11 @@ void clean_export_paths(struct gsh_export *export)
  * fsal method can process the rest of the parameters in the block
  */
 
+void *store_node = NULL;
+void *store_link_mem = NULL;
+void *store_self_struct = NULL;
+struct config_error_type *store_err_type = NULL;
+
 static int fsal_cfg_commit(void *node, void *link_mem, void *self_struct,
 			   struct config_error_type *err_type)
 {
@@ -769,6 +774,13 @@ static int fsal_cfg_commit(void *node, void *link_mem, void *self_struct,
 			     atomic_fetch_int32_t(&fsal->refcount));
 		err_type->export_ = true;
 		errcnt++;
+
+        // TODO this could probably be done in the FSAL, but
+        // I'd rather just kill this method entirely!
+        store_node        = node;
+        store_link_mem    = link_mem;
+        store_self_struct = self_struct;
+        store_err_type    = err_type;
 		goto err;
 	}
 
@@ -803,6 +815,68 @@ err:
 	/* Don't leak the FSAL block */
 	err_type->dispose = true;
 	return errcnt;
+}
+
+void update_proxyv4()
+{
+    // TODO FSAL knows the node, use that...
+	struct config_error_type err_type;
+	bool status = true;
+	int rc, exp_cnt = 0;
+	char *export_expr = "EXPORT(Path=/fakefake)";
+	config_file_t config_struct = NULL;
+	struct config_node_list *config_list, *lp, *lp_next;
+	char *err_detail = NULL;
+
+	assert(init_error_type(&err_type));
+
+	config_struct = config_ParseFile("/etc/ganesha/ganesha.conf", &err_type);
+
+	if (!config_error_is_harmless(&err_type)) {
+		err_detail = err_type_str(&err_type);
+        fprintf(stderr, "Error while parsing %s", err_detail);
+		status = false;
+	}
+	rc = find_config_nodes(config_struct, export_expr,
+			       &config_list, &err_type);
+
+	if (rc != 0) {
+		fprintf(stderr,
+			"Error finding exports: %s because %s",
+			export_expr, strerror(rc));
+		status = false;
+	}
+    else
+    {
+		fprintf(stderr,
+			"success exports: %s\n",
+			export_expr);
+    }
+	for (lp = config_list; lp != NULL; lp = lp_next) {
+		lp_next = lp->next;
+		if (status) {
+			rc = load_config_from_node(lp->tree_node,
+						   &add_export_param,
+						   NULL,
+						   false,
+						   &err_type);
+			if (rc == 0 || config_error_is_harmless(&err_type))
+				exp_cnt++;
+			else if (!err_type.exists)
+				status = false;
+		}
+		gsh_free(lp);
+	}
+    if (status)
+    {
+        fprintf(stderr, "Success?\n");
+    }
+    else
+    {
+		err_detail = err_type_str(&err_type);
+
+        fprintf(stderr, "Failure? %s\n", err_detail);
+    }
 }
 
 /**

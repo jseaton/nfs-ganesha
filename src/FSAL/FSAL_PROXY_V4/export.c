@@ -32,16 +32,16 @@
 #include "FSAL/fsal_config.h"
 #include "proxyv4_fsal_methods.h"
 #include "nfs_exports.h"
+#include "nfs_core.h"
+#include "mdcache.h"
 #include "export_mgr.h"
 
-#ifdef _USE_GSSRPC
 static struct config_item_list sec_types[] = {
 	CONFIG_LIST_TOK("krb5", RPCSEC_GSS_SVC_NONE),
 	CONFIG_LIST_TOK("krb5i", RPCSEC_GSS_SVC_INTEGRITY),
 	CONFIG_LIST_TOK("krb5p", RPCSEC_GSS_SVC_PRIVACY),
 	CONFIG_LIST_EOL
 };
-#endif
 
 static struct config_item proxyv4_export_params[] = {
 	CONF_ITEM_NOOP("name"),
@@ -65,10 +65,10 @@ static struct config_item proxyv4_export_params[] = {
 		       proxyv4_client_params, use_privileged_client_port),
 	CONF_ITEM_UI32("RPC_Client_Timeout", 1, 60*4, 60,
 		       proxyv4_client_params, srv_timeout),
-#ifdef _USE_GSSRPC
+
 	CONF_ITEM_STR("Remote_PrincipalName", 0, MAXNAMLEN, NULL,
 		      proxyv4_client_params, remote_principal),
-	CONF_ITEM_STR("KeytabPath", 0, MAXPATHLEN, "/etc/krb5.keytab"
+	CONF_ITEM_STR("KeytabPath", 0, MAXPATHLEN, "/etc/krb5.keytab",
 		      proxyv4_client_params, keytab),
 	CONF_ITEM_UI32("Credential_LifeTime", 0, 86400*2, 86400,
 		       proxyv4_client_params, cred_lifetime),
@@ -76,7 +76,7 @@ static struct config_item proxyv4_export_params[] = {
 			proxyv4_client_params, sec_type),
 	CONF_ITEM_BOOL("Active_krb5", false,
 		       proxyv4_client_params, active_krb5),
-#endif
+
 #ifdef PROXYV4_HANDLE_MAPPING
 	CONF_ITEM_BOOL("Enable_Handle_Mapping", false,
 		       proxyv4_client_params, enable_handle_mapping),
@@ -161,11 +161,19 @@ void proxyv4_export_ops_init(struct export_ops *ops)
 	ops->free_state = proxyv4_free_state;
 }
 
+static int proxyv4_init = 0;
+
 fsal_status_t proxyv4_create_export(struct fsal_module *fsal_hdl,
 				    void *parse_node,
 				    struct config_error_type *err_type,
 				    const struct fsal_up_vector *up_ops)
 {
+	if (!proxyv4_init)
+	{
+		proxyv4_init++;
+		return fsalstat(ERR_FSAL_INVAL, 0);
+	}
+
 	fsal_status_t fsal_status = {0, 0};
 	struct proxyv4_export *exp = gsh_calloc(1, sizeof(*exp));
 	int rc;

@@ -1056,7 +1056,7 @@ static bool gsh_export_addexport(DBusMessageIter *args,
 	if (!config_error_is_harmless(&err_type)) {
 		err_detail = err_type_str(&err_type);
 		LogCrit(COMPONENT_EXPORT,
-			"Error while parsing %s", file_path);
+			"Error while parsing %s"c file_path);
 		report_config_errors(&err_type,
 				     &conf_errs,
 				     config_errs_to_dbus);

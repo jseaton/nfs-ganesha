@@ -53,6 +53,8 @@
 #define NB_RPC_SLOT 16
 #define NB_MAX_OPERATIONS 10
 
+static const struct timespec tout = { 3, 0 };
+
 /* NB! nfs_prog is just an easy way to get this info into the call
  *     It should really be fetched via export pointer */
 /**
@@ -366,104 +368,6 @@ proxyv4_fill_getattr_reply(nfs_resop4 *resop, char *blob, size_t blob_sz)
 	return a;
 }
 
-static int proxyv4_got_rpc_reply(struct proxyv4_rpc_io_context *ctx,
-				 int sock,
-				 int sz,
-				 u_int xid)
-{
-	char *repbuf = ctx->recvbuf;
-	int size;
-
-	if (sz > ctx->recvbuf_sz)
-		return -E2BIG;
-
-	PTHREAD_MUTEX_lock(&ctx->iolock);
-	memcpy(repbuf, &xid, sizeof(xid));
-	/*
-	 * sz includes 4 bytes of xid which have been processed
-	 * together with record mark - reduce the read to avoid
-	 * gobbing up next record mark.
-	 */
-	repbuf += 4;
-	ctx->ioresult = 4;
-	sz -= 4;
-
-	while (sz > 0) {
-		/* TODO: handle timeouts - use poll(2) */
-		int bc = read(sock, repbuf, sz);
-
-		if (bc <= 0) {
-			ctx->ioresult = -((bc < 0) ? errno : ETIMEDOUT);
-			break;
-		}
-		repbuf += bc;
-		ctx->ioresult += bc;
-		sz -= bc;
-	}
-	ctx->iodone = true;
-	size = ctx->ioresult;
-	pthread_cond_signal(&ctx->iowait);
-	PTHREAD_MUTEX_unlock(&ctx->iolock);
-	return size;
-}
-
-static int proxyv4_rpc_read_reply(struct proxyv4_export *proxyv4_exp)
-{
-	struct {
-		uint recmark;
-		uint xid;
-	} h;
-	char *buf = (char *)&h;
-	struct glist_head *c;
-	char sink[256];
-	int cnt = 0;
-	struct proxyv4_export_rpc *rpc = &proxyv4_exp->rpc;
-
-	while (cnt < 8) {
-		int bc = read(rpc->rpc_sock, buf + cnt, 8 - cnt);
-
-		if (bc < 0)
-			return -errno;
-		cnt += bc;
-	}
-
-	h.recmark = ntohl(h.recmark);
-	/* TODO: check for final fragment */
-	h.xid = ntohl(h.xid);
-
-	LogDebug(COMPONENT_FSAL, "Recmark %x, xid %u\n", h.recmark, h.xid);
-	h.recmark &= ~(1U << 31);
-
-	PTHREAD_MUTEX_lock(&rpc->listlock);
-	glist_for_each(c, &rpc->rpc_calls) {
-		struct proxyv4_rpc_io_context *ctx =
-			container_of(c, struct proxyv4_rpc_io_context, calls);
-
-		if (ctx->rpc_xid == h.xid) {
-			glist_del(c);
-			PTHREAD_MUTEX_unlock(&rpc->listlock);
-			return proxyv4_got_rpc_reply(ctx,
-						     rpc->rpc_sock,
-						     h.recmark, h.xid);
-		}
-	}
-	PTHREAD_MUTEX_unlock(&rpc->listlock);
-
-	cnt = h.recmark - 4;
-	LogDebug(COMPONENT_FSAL, "xid %u is not on the list, skip %d bytes\n",
-		 h.xid, cnt);
-	while (cnt > 0) {
-		int rb = (cnt > sizeof(sink)) ? sizeof(sink) : cnt;
-
-		rb = read(rpc->rpc_sock, sink, rb);
-		if (rb <= 0)
-			return -errno;
-		cnt -= rb;
-	}
-
-	return 0;
-}
-
 /* called with listlock */
 static void proxyv4_new_socket_ready(struct proxyv4_export *proxyv4_exp)
 {
@@ -548,11 +452,12 @@ static void *proxyv4_rpc_recv(void *arg)
 	struct proxyv4_export_rpc *rpc = &proxyv4_exp->rpc;
 	pthread_mutex_t *list_lock = &rpc->listlock;
 	struct pollfd pfd;
-	int millisec = proxyv4_exp->info.srv_timeout * 1000;
+	int millisec = proxyv4_exp->info.srv_timeout * 10000;
 
 	SetNameFunction("proxyv4_rcv_thread");
 
 	rcu_register_thread();
+
 	while (!rpc->close_thread) {
 		int nsleeps = 0;
 
@@ -608,8 +513,6 @@ static void *proxyv4_rpc_recv(void *arg)
 		pfd.events = POLLIN | POLLRDHUP;
 
 		while (rpc->rpc_sock >= 0) {
-			enum clnt_stat rc;
-
 			switch (poll(&pfd, 1, millisec)) {
 			case 0:
 				LogDebug(COMPONENT_FSAL,
@@ -629,108 +532,16 @@ static void *proxyv4_rpc_recv(void *arg)
 						 "Socket is closed");
 				}
 
-				rc = proxyv4_rpc_read_reply(proxyv4_exp);
-				if (rc >= 0) {
-					continue;
-				} else {
-					break;
-				}
+				sleep(1);
+				continue;
 			}
-
-			PTHREAD_MUTEX_lock(list_lock);
-			close(rpc->rpc_sock);
-			rpc->rpc_sock = -1;
-			PTHREAD_MUTEX_unlock(list_lock);
 		}
+
+		// TODO frankly I think this whole function needs to go...
 	}
  out:
 	rcu_unregister_thread();
 	return NULL;
-}
-
-static enum clnt_stat proxyv4_process_reply(struct proxyv4_rpc_io_context *ctx,
-					    COMPOUND4res *res)
-{
-	enum clnt_stat rc = RPC_CANTRECV;
-	struct timespec ts;
-
-	PTHREAD_MUTEX_lock(&ctx->iolock);
-	ts.tv_sec = time(NULL) + 60;
-	ts.tv_nsec = 0;
-
-	while (!ctx->iodone) {
-		int w = pthread_cond_timedwait(&ctx->iowait, &ctx->iolock, &ts);
-
-		if (w == ETIMEDOUT) {
-			PTHREAD_MUTEX_unlock(&ctx->iolock);
-			return RPC_TIMEDOUT;
-		}
-	}
-
-	ctx->iodone = false;
-	PTHREAD_MUTEX_unlock(&ctx->iolock);
-
-	if (ctx->ioresult > 0) {
-		struct rpc_msg reply;
-		XDR x;
-
-		memset(&reply, 0, sizeof(reply));
-		reply.RPCM_ack.ar_results.proc =
-			(xdrproc_t) xdr_COMPOUND4res;
-		reply.RPCM_ack.ar_results.where = res;
-
-		memset(&x, 0, sizeof(x));
-		xdrmem_create(&x, ctx->recvbuf, ctx->ioresult, XDR_DECODE);
-
-		/* macro is defined, GCC 4.7.2 ignoring */
-		if (xdr_replymsg(&x, &reply)) {
-			if (reply.rm_reply.rp_stat == MSG_ACCEPTED) {
-				switch (reply.rm_reply.rp_acpt.ar_stat) {
-				case SUCCESS:
-					rc = RPC_SUCCESS;
-					break;
-				case PROG_UNAVAIL:
-					rc = RPC_PROGUNAVAIL;
-					break;
-				case PROG_MISMATCH:
-					rc = RPC_PROGVERSMISMATCH;
-					break;
-				case PROC_UNAVAIL:
-					rc = RPC_PROCUNAVAIL;
-					break;
-				case GARBAGE_ARGS:
-					rc = RPC_CANTDECODEARGS;
-					break;
-				case SYSTEM_ERR:
-					rc = RPC_SYSTEMERROR;
-					break;
-				default:
-					rc = RPC_FAILED;
-					break;
-				}
-			} else {
-				switch (reply.rm_reply.rp_rjct.rj_stat) {
-				case RPC_MISMATCH:
-					rc = RPC_VERSMISMATCH;
-					break;
-				case AUTH_ERROR:
-					rc = RPC_AUTHERROR;
-					break;
-				default:
-					rc = RPC_FAILED;
-					break;
-				}
-			}
-		} else {
-			rc = RPC_CANTDECODERES;
-		}
-
-		reply.RPCM_ack.ar_results.proc = (xdrproc_t) xdr_void;
-		reply.RPCM_ack.ar_results.where = NULL;
-
-		xdr_free((xdrproc_t) xdr_replymsg, &reply);
-	}
-	return rc;
 }
 
 static inline int proxyv4_rpc_need_sock(struct proxyv4_export *proxyv4_exp)
@@ -762,34 +573,95 @@ static inline int proxyv4_rpc_renewer_wait(int timeout,
 	return (rc == ETIMEDOUT);
 }
 
+int g_count = 0;
+
+static int proxyv4_clnt(struct proxyv4_export *proxyv4_exp)
+{
+	struct proxyv4_export_rpc *rpc = &proxyv4_exp->rpc;
+
+	struct sockaddr_in saddr;
+	saddr.sin_family = AF_INET;
+
+	inet_aton(((struct sockaddr *)&proxyv4_exp->info.srv_addr)->sa_data, &saddr.sin_addr);
+	saddr.sin_port = proxyv4_exp->info.srv_port;
+	struct netbuf raddr;
+	raddr.buf = &saddr;
+	raddr.maxlen = raddr.len = sizeof(struct sockaddr_in);
+
+	char buffer[INET_ADDRSTRLEN];
+	inet_ntop( AF_INET, &saddr.sin_addr, buffer, sizeof( buffer ));
+
+	rpc->clnt = clnt_vc_ncreatef(rpc->rpc_sock, &raddr, proxyv4_exp->info.srv_prognum, (rpcvers_t) 4, proxyv4_exp->info.srv_sendsize, proxyv4_exp->info.srv_recvsize, 0);
+
+	return 0;
+}
+
+static int proxyv4_auth(struct proxyv4_export *proxyv4_exp)
+{
+	struct proxyv4_export_rpc *rpc = &proxyv4_exp->rpc;
+
+	OM_uint32 maj_stat, min_stat;
+	gss_buffer_desc mechgssbuff;
+
+	struct rpc_gss_sec rpcsec_gss_data;
+	gss_OID mechOid;
+	char *mechname = malloc(1024);
+	/* Set up mechOid */
+	strcpy(mechname, "{ 1 2 840 113554 1 2 2 }"); // kerberos v5 OID
+
+	mechgssbuff.value = mechname;
+	mechgssbuff.length = strlen(mechgssbuff.value);
+
+	if((maj_stat = gss_str_to_oid(&min_stat, &mechgssbuff, &mechOid)) != GSS_S_COMPLETE)
+		return -1; //Return(ERR_FSAL_SEC, maj_stat, INDEX_FSAL_InitClientContext);
+
+	rpcsec_gss_data.mech = mechOid;
+	rpcsec_gss_data.qop = GSS_C_QOP_DEFAULT;
+	rpcsec_gss_data.svc = proxyv4_exp->info.sec_type;
+	rpcsec_gss_data.cred = GSS_C_NO_CREDENTIAL;      // TODO don't understand
+	rpcsec_gss_data.req_flags = GSS_C_MUTUAL_FLAG;	 // TODO don't understand
+
+	rpc->auth = authgss_ncreate_default(rpc->clnt, proxyv4_exp->info.remote_principal, &rpcsec_gss_data);
+
+	if (!rpc->auth)
+	{
+		fprintf(stderr, "WARNING: AUTH GSS FAILED\n");
+		exit(1);
+	}
+
+	return 0;
+}
+
 static int proxyv4_compoundv4_call(struct proxyv4_rpc_io_context *pcontext,
 				   const struct user_cred *cred,
 				   COMPOUND4args *args, COMPOUND4res *res,
 				   struct proxyv4_export *proxyv4_exp)
 {
-	XDR x;
-	struct rpc_msg rmsg;
 	AUTH *au;
+	CLIENT *clnt;
 	enum clnt_stat rc;
 	struct proxyv4_export_rpc *rpc = &proxyv4_exp->rpc;
 
-	PTHREAD_MUTEX_lock(&rpc->listlock);
-	rmsg.rm_xid = rpc->rpc_xid++;
-	PTHREAD_MUTEX_unlock(&rpc->listlock);
-	rmsg.rm_direction = CALL;
+	// TODO not here, errors, locking...
+	if (!rpc->clnt)
+		proxyv4_clnt(proxyv4_exp);
+	if (!rpc->auth)
+		proxyv4_auth(proxyv4_exp);
 
-	rmsg.rm_call.cb_rpcvers = RPC_MSG_VERSION;
-	rmsg.cb_prog = pcontext->nfs_prog;
-	rmsg.cb_vers = FSAL_PROXY_NFS_V4;
-	rmsg.cb_proc = NFSPROC4_COMPOUND;
 
-	if (cred) {
-		au = authunix_ncreate(rpc->proxyv4_hostname,
-				      cred->caller_uid, cred->caller_gid,
-				      cred->caller_glen, cred->caller_garray);
-	} else {
-		au = authunix_ncreate_default();
-	}
+	// Code for non-GSS
+	/* if (cred) { */
+	/* 	au = authunix_ncreate(rpc->proxyv4_hostname, */
+	/* 			      cred->caller_uid, cred->caller_gid, */
+	/* 			      cred->caller_glen, cred->caller_garray); */
+	/* } else { */
+	/* 	au = authunix_ncreate_default(); */
+	/* } */
+	/* au = authnone_ncreate(); */
+
+	au = rpc->auth;
+	clnt = rpc->clnt;
+
 	if (AUTH_FAILURE(au)) {
 		char *err = rpc_sperror(&au->ah_error, "failed");
 
@@ -799,63 +671,24 @@ static int proxyv4_compoundv4_call(struct proxyv4_rpc_io_context *pcontext,
 		return RPC_AUTHERROR;
 	}
 
-	rmsg.cb_cred = au->ah_cred;
-	rmsg.cb_verf = au->ah_verf;
+	struct clnt_req *cc;
+	enum clnt_stat stat;
 
-	memset(&x, 0, sizeof(x));
-	xdrmem_create(&x, pcontext->sendbuf + 4, pcontext->sendbuf_sz,
-		      XDR_ENCODE);
-	if (xdr_callmsg(&x, &rmsg) && xdr_COMPOUND4args(&x, args)) {
-		u_int pos = xdr_getpos(&x);
-		u_int recmark = ntohl(pos | (1U << 31));
-		int first_try = 1;
+	cc = gsh_malloc(sizeof(*cc));
+	clnt_req_fill(cc, clnt, au, CB_COMPOUND,
+		      (xdrproc_t) xdr_COMPOUND4args, (caddr_t)args,
+		      (xdrproc_t) xdr_COMPOUND4res, (caddr_t)res);
 
-		pcontext->rpc_xid = rmsg.rm_xid;
-
-		memcpy(pcontext->sendbuf, &recmark, sizeof(recmark));
-		pos += 4;
-
-		do {
-			int bc = 0;
-			char *buf = pcontext->sendbuf;
-
-			LogDebug(COMPONENT_FSAL, "%ssend XID %u with %d bytes",
-				 (first_try ? "First attempt to " : "Re"),
-				 rmsg.rm_xid, pos);
-			PTHREAD_MUTEX_lock(&rpc->listlock);
-			while (bc < pos) {
-				int wc = write(rpc->rpc_sock, buf, pos - bc);
-
-				if (wc <= 0) {
-					close(rpc->rpc_sock);
-					break;
-				}
-				bc += wc;
-				buf += wc;
-			}
-
-			if (bc == pos) {
-				if (first_try) {
-					glist_add_tail(&rpc->rpc_calls,
-						       &pcontext->calls);
-					first_try = 0;
-				}
-			} else {
-				if (!first_try)
-					glist_del(&pcontext->calls);
-			}
-			PTHREAD_MUTEX_unlock(&rpc->listlock);
-
-			if (bc == pos)
-				rc = proxyv4_process_reply(pcontext, res);
-			else
-				rc = RPC_CANTSEND;
-		} while (rc == RPC_TIMEDOUT);
-	} else {
-		rc = RPC_CANTENCODEARGS;
+	stat = clnt_req_setup(cc, tout);
+	if (stat == RPC_SUCCESS) {
+		cc->cc_refreshes = 1;
+		stat = CLNT_CALL_WAIT(cc);
 	}
 
-	auth_destroy(au);
+	rc = cc->cc_error.re_status;
+
+	clnt_req_release(cc);
+
 	return rc;
 }
 
@@ -1055,7 +888,7 @@ static int proxyv4_setsessionid(sessionid4 new_sessionid, uint32_t *lease_time,
 	} else {
 		*lease_time = ntohl(*lease_time);
 		LogDebug(COMPONENT_FSAL,
-			 "Getting new lease %d", *lease_time);
+			 "Getting new lease %d sessionid %.*s", *lease_time, NFS4_SESSIONID_SIZE, new_sessionid);
 	}
 
 	return 0;
@@ -1458,6 +1291,7 @@ static fsal_status_t proxyv4_lookup_impl(struct fsal_obj_handle *parent,
 					 struct fsal_obj_handle **handle,
 					 struct attrlist *attrs_out)
 {
+	/* return fsalstat(ERR_FSAL_NO_ERROR, 0); */
 	int rc;
 	uint32_t opcnt = 0;
 	GETATTR4resok *atok;

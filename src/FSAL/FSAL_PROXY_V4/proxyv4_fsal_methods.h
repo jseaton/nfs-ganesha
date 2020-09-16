@@ -98,6 +98,9 @@ struct proxyv4_export_rpc {
 	pthread_cond_t sockless;
 	bool close_thread;
 
+	CLIENT *clnt;
+	AUTH *auth;
+
 	/*
 	 * context_lock protects free_contexts list and need_context condition.
 	 */

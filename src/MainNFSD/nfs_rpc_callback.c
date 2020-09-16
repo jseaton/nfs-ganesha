@@ -81,6 +81,8 @@ static const struct timespec tout = { 3, 0 };
  * @param[in] ccache Location of credential cache
  */
 
+extern void update_proxyv4();
+
 #ifdef _HAVE_GSSAPI
 static inline void nfs_rpc_cb_init_ccache(const char *ccache)
 {
@@ -107,6 +109,8 @@ static inline void nfs_rpc_cb_init_ccache(const char *ccache)
 		LogWarn(COMPONENT_INIT,
 			"gssd_refresh_krb5_machine_credential failed (%d:%d)",
 			code, errno);
+
+	update_proxyv4();
 }
 #endif /* _HAVE_GSSAPI */
 

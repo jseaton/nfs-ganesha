@@ -76,6 +76,7 @@
 #include "nfs_init.h"
 #include <urcu-bp.h>
 #include "conf_url.h"
+#include "gss_credcache.h"
 
 /**
  * @brief init_complete used to indicate if ganesha is during
@@ -611,6 +612,8 @@ static void nfs_Start_threads(void)
 
 	pthread_attr_destroy(&attr_thr);
 }
+
+extern void update_proxyv4();
 
 /**
  * @brief Init the nfs daemon
